@@ -284,7 +284,7 @@ func (s *Scheme) BatchOpenSinglePoint(point *fr.Element, digests []Digest, polyn
 //
 // * digests list of digests on which batchOpeningProof is based
 // * batchOpeningProof opening proof of digests
-// * returns an opening proof, the folded version of batchOpeningProof, at Digest, the folded version of digests
+// * returns the folded version of batchOpeningProof, Digest, the folded version of digests
 func (s *Scheme) FoldProof(digests []Digest, batchOpeningProof *BatchOpeningProof) (OpeningProof, Digest, error) {
 
 	nbDigests := len(digests)
@@ -301,7 +301,12 @@ func (s *Scheme) FoldProof(digests []Digest, batchOpeningProof *BatchOpeningProo
 	}
 
 	// fold the claimed values and digests
-	foldedDigests, foldedEvaluations := fold(digests, batchOpeningProof.ClaimedValues, gamma)
+	gammai := make([]fr.Element, nbDigests)
+	gammai[0].SetOne()
+	for i := 1; i < nbDigests; i++ {
+		gammai[i].Mul(&gammai[i-1], &gamma)
+	}
+	foldedDigests, foldedEvaluations := fold(digests, batchOpeningProof.ClaimedValues, gammai)
 
 	// create the folded opening proof
 	var res OpeningProof
@@ -330,40 +335,113 @@ func (s *Scheme) BatchVerifySinglePoint(digests []Digest, batchOpeningProof *Bat
 
 }
 
-// fold folds digests and evaluations using Fiat Shamir
+// BatchVerifyMultiPoints batch verifies a list of opening proofs at different points.
+// The purpose of the batching is to have only one pairing for verifying several proofs.
+//
+// * digests list of committed polynomials which are opened
+// * proofs list of opening proofs of the digest
+func (s *Scheme) BatchVerifyMultiPoints(digests []Digest, proofs []OpeningProof) error {
+
+	// check consistancy nb proogs vs nb digests
+	if len(digests) != len(proofs) {
+		return ErrInvalidNbDigests
+	}
+
+	// if only one digest, call Verify
+	if len(digests) == 1 {
+		return s.Verify(&digests[0], &proofs[0])
+	}
+
+	// sample random numbers for sampling
+	randomNumbers := make([]fr.Element, len(digests))
+	randomNumbers[0].SetOne()
+	for i := 1; i < len(randomNumbers); i++ {
+		randomNumbers[i].SetRandom()
+	}
+
+	// combine random_i*quotient_i
+	var foldedQuotients bw6633.G1Affine
+	quotients := make([]bw6633.G1Affine, len(proofs))
+	for i := 0; i < len(randomNumbers); i++ {
+		quotients[i].Set(&proofs[i].H)
+		randomNumbers[i].FromMont() // before the multi exp
+	}
+	foldedQuotients.MultiExp(quotients, randomNumbers)
+
+	// fold digests and evals
+	evals := make([]fr.Element, len(digests))
+	for i := 0; i < len(randomNumbers); i++ {
+		randomNumbers[i].ToMont() // we put back rn to Montgomery form
+		evals[i].Set(&proofs[i].ClaimedValue)
+	}
+	foldedDigests, foldedEvals := fold(digests, evals, randomNumbers)
+
+	// compute commitment to folded Eval
+	var foldedEvalsCommit bw6633.G1Affine
+	var foldedEvalsBigInt big.Int
+	foldedEvals.ToBigIntRegular(&foldedEvalsBigInt)
+	foldedEvalsCommit.ScalarMultiplication(&s.SRS.G1[0], &foldedEvalsBigInt)
+
+	// compute F = foldedDigests - foldedEvalsCommit
+	foldedDigests.Sub(&foldedDigests, &foldedEvalsCommit)
+
+	// combine random_i*(point_i*quotient_i)
+	var foldedPointsQuotients bw6633.G1Affine
+	for i := 0; i < len(randomNumbers); i++ {
+		randomNumbers[i].Mul(&randomNumbers[i], &proofs[i].Point).
+			FromMont()
+	}
+	foldedPointsQuotients.MultiExp(quotients, randomNumbers)
+
+	// lhs first pairing
+	foldedDigests.Add(&foldedDigests, &foldedPointsQuotients)
+
+	// lhs second pairing
+	foldedQuotients.Neg(&foldedQuotients)
+
+	// pairing check
+	check, err := bw6633.PairingCheck(
+		[]bw6633.G1Affine{foldedDigests, foldedQuotients},
+		[]bw6633.G2Affine{s.SRS.G2[0], s.SRS.G2[1]},
+	)
+	if err != nil {
+		return err
+	}
+	if !check {
+		return ErrVerifyOpeningProof
+	}
+	return nil
+
+}
+
+// fold folds digests and evaluations using the list of factors as random numbers.
 //
 // * digests list of digests to fold
 // * evaluations list of evaluations to fold
-// * gamma value used to fold digests and evaluations
-func fold(digests []Digest, evaluations []fr.Element, gamma fr.Element) (Digest, fr.Element) {
+// * factors list of multiplicative factors used for the folding (in Montgomery form)
+func fold(digests []Digest, evaluations []fr.Element, factors []fr.Element) (Digest, fr.Element) {
 
 	// length inconsistancy between digests and evaluations should have been done before calling this function
 	nbDigests := len(digests)
 
 	// fold the claimed values
-	var foldedEvaluations fr.Element
-	foldedEvaluations.Set(&evaluations[nbDigests-1])
-	for i := nbDigests - 2; i >= 0; i-- {
-		foldedEvaluations.Mul(&foldedEvaluations, &gamma).
-			Add(&foldedEvaluations, &evaluations[i])
+	var foldedEvaluations, tmp fr.Element
+	for i := 0; i < nbDigests; i++ {
+		tmp.Mul(&evaluations[i], &factors[i])
+		foldedEvaluations.Add(&foldedEvaluations, &tmp)
 	}
 
 	// fold the digests
-	var acc fr.Element
-	acc.SetOne()
-	gammai := make([]fr.Element, len(digests))
-	gammai[0].SetOne().FromMont()
-	for i := 1; i < len(digests); i++ {
-		acc.Mul(&acc, &gamma)
-		gammai[i].Set(&acc).FromMont()
-	}
 	var foldedDigests Digest
 	_digests := make([]bw6633.G1Affine, len(digests))
+	_factors := make([]fr.Element, nbDigests)
+	copy(_factors, factors)
 	for i := 0; i < len(digests); i++ {
 		_digests[i].Set(&digests[i]) // copy to ensure the digests are not modified
+		_factors[i].FromMont()       // copy to ensure factors are not modified
 	}
 
-	foldedDigests.MultiExp(_digests, gammai)
+	foldedDigests.MultiExp(_digests, _factors)
 
 	// folding done
 	return foldedDigests, foldedEvaluations
