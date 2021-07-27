@@ -17,11 +17,10 @@
 package fft
 
 import (
-	"math/bits"
-	"runtime"
-
 	"github.com/consensys/gnark-crypto/ecc"
 	"github.com/consensys/gnark-crypto/internal/parallel"
+	"math/bits"
+	"runtime"
 
 	"github.com/consensys/gnark-crypto/ecc/bls24-315/fr"
 )
@@ -163,65 +162,60 @@ func (domain *Domain) FFTInverse(a []fr.Element, decimation Decimation, coset ui
 }
 
 func difFFT(a []fr.Element, twiddles [][]fr.Element, stage, maxSplits int, chDone chan struct{}) {
-	if chDone != nil {
-		defer func() {
-			chDone <- struct{}{}
-		}()
-	}
 	n := len(a)
 	if n == 1 {
 		return
 	}
-	m := n >> 1
+	m := n
+	for stage := 0; stage < len(twiddles); stage++ {
+		m >>= 1
+		nbLoops := 1 << stage
+		// each loop contains
+		// outter loop is using nbLoops / nbCpus
+		// so if nbLoops < nbCpus, we have some Cpus left.
+		bCPU := runtime.NumCPU() / (1 << (stage))
 
-	// if stage < maxSplits, we parallelize this butterfly
-	// but we have only numCPU / stage cpus available
-	if (m > butterflyThreshold) && (stage < maxSplits) {
-		// 1 << stage == estimated used CPUs
-		numCPU := runtime.NumCPU() / (1 << (stage))
-		parallel.Execute(m, func(start, end int) {
-			var t fr.Element
-			for i := start; i < end; i++ {
-				t = a[i]
-				a[i].Add(&a[i], &a[i+m])
+		if bCPU <= 1 {
+			for nn := 0; nn < nbLoops; nn++ {
+				// each time we visit the whole a[:n]
+				// technically we want to parallelize the work among N go routines
+				// processing 1 / N of the work each time.
+				offset := nn << 1
+				b := a[offset*m : (offset+2)*m]
+				var t fr.Element
+				for i := 0; i < len(b)-m; i++ {
+					t = b[i]
+					b[i].Add(&b[i], &b[i+m])
+					b[i+m].
+						Sub(&t, &b[i+m]).
+						Mul(&b[i+m], &twiddles[stage][i])
+				}
 
-				a[i+m].
-					Sub(&t, &a[i+m]).
-					Mul(&a[i+m], &twiddles[stage][i])
 			}
-		}, numCPU)
-	} else {
-		var t fr.Element
+		} else {
+			parallel.Execute(nbLoops, func(start, end int) {
+				for nn := start; nn < end; nn++ {
+					// each time we visit the whole a[:n]
+					// technically we want to parallelize the work among N go routines
+					// processing 1 / N of the work each time.
+					offset := nn << 1
+					b := a[offset*m : (offset+2)*m]
+					parallel.Execute(len(b)-m, func(start, end int) {
+						var t fr.Element
+						for i := start; i < end; i++ {
+							t = b[i]
+							b[i].Add(&b[i], &b[i+m])
+							b[i+m].
+								Sub(&t, &b[i+m]).
+								Mul(&b[i+m], &twiddles[stage][i])
+						}
+					}, bCPU)
 
-		// i == 0
-		t = a[0]
-		a[0].Add(&a[0], &a[m])
-		a[m].Sub(&t, &a[m])
-
-		for i := 1; i < m; i++ {
-			t = a[i]
-			a[i].Add(&a[i], &a[i+m])
-
-			a[i+m].
-				Sub(&t, &a[i+m]).
-				Mul(&a[i+m], &twiddles[stage][i])
+				}
+			})
 		}
 	}
 
-	if m == 1 {
-		return
-	}
-
-	nextStage := stage + 1
-	if stage < maxSplits {
-		chDone := make(chan struct{}, 1)
-		go difFFT(a[m:n], twiddles, nextStage, maxSplits, chDone)
-		difFFT(a[0:m], twiddles, nextStage, maxSplits, nil)
-		<-chDone
-	} else {
-		difFFT(a[0:m], twiddles, nextStage, maxSplits, nil)
-		difFFT(a[m:n], twiddles, nextStage, maxSplits, nil)
-	}
 }
 
 func ditFFT(a []fr.Element, twiddles [][]fr.Element, stage, maxSplits int, chDone chan struct{}) {
