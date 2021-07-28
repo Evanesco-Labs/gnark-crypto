@@ -1,0 +1,8 @@
+goos: darwin
+goarch: amd64
+pkg: github.com/consensys/gnark-crypto/ecc/bn254/fr/fft
+cpu: Intel(R) Core(TM) i7-6920HQ CPU @ 2.90GHz
+BenchmarkFFTDIFReference-8   	       4	 301240348 ns/op
+BenchmarkFFTDIFReference-8   	       4	 301716466 ns/op
+PASS
+ok  	github.com/consensys/gnark-crypto/ecc/bn254/fr/fft	9.540s
