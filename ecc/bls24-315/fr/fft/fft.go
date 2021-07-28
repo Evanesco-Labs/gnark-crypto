@@ -21,6 +21,7 @@ import (
 	"github.com/consensys/gnark-crypto/internal/parallel"
 	"math/bits"
 	"runtime"
+	"sync"
 
 	"github.com/consensys/gnark-crypto/ecc/bls24-315/fr"
 )
@@ -167,54 +168,90 @@ func difFFT(a []fr.Element, twiddles [][]fr.Element, stage, maxSplits int, chDon
 		return
 	}
 	m := n
-	for stage := 0; stage < len(twiddles); stage++ {
+
+	// the first stages of the FFT, we parallelize the butterfly operations with all core
+	// when we reach the stage of FFT where nb sub arrays == nb cpus available, we launch independent go routines
+
+	nCpus := int(ecc.NextPowerOfTwo(uint64(runtime.NumCPU())))
+
+	for stage = 0; stage < len(twiddles); stage++ {
+		if 1<<stage == nCpus {
+			break
+		}
 		m >>= 1
 		nbLoops := 1 << stage
-		// each loop contains
-		// outter loop is using nbLoops / nbCpus
-		// so if nbLoops < nbCpus, we have some Cpus left.
-		bCPU := runtime.NumCPU() / (1 << (stage))
-
-		if bCPU <= 1 {
-			for nn := 0; nn < nbLoops; nn++ {
+		bCpus := nCpus / nbLoops
+		// TODO we could try to fire one go routine per loop and use nCpu / nbLoops CPU per butterfly
+		var wg sync.WaitGroup
+		wg.Add(nbLoops)
+		for nn := 0; nn < nbLoops; nn++ {
+			go func(nn int) {
 				// each time we visit the whole a[:n]
 				// technically we want to parallelize the work among N go routines
 				// processing 1 / N of the work each time.
 				offset := nn << 1
 				b := a[offset*m : (offset+2)*m]
+				parallel.Execute(len(b)-m, func(start, end int) {
+					var t fr.Element
+					for i := start; i < end; i++ {
+						t = b[i]
+						b[i].Add(&b[i], &b[i+m])
+						b[i+m].
+							Sub(&t, &b[i+m]).
+							Mul(&b[i+m], &twiddles[stage][i])
+					}
+				}, bCpus)
+				wg.Done()
+			}(nn)
+		}
+		wg.Wait()
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(nCpus)
+	worker := func(subfft []fr.Element, _stage int) {
+		_m := len(subfft)
+
+		// now we can parallelize the rest of the array
+		for ; _stage < len(twiddles); _stage++ {
+			_m >>= 1
+			nbLoops := 1 << _stage
+			nbLoops /= nCpus
+			for nn := 0; nn < nbLoops; nn++ {
+				// each time we visit the whole a[:n]
+				// technically we want to parallelize the work among N go routines
+				// processing 1 / N of the work each time.
+				offset := nn << 1
+				b := subfft[offset*_m : (offset+2)*_m]
 				var t fr.Element
-				for i := 0; i < len(b)-m; i++ {
+				t = b[0]
+				b[0].Add(&b[0], &b[_m])
+				b[_m].
+					Sub(&t, &b[_m])
+				for i := 1; i < len(b)-_m; i++ {
 					t = b[i]
-					b[i].Add(&b[i], &b[i+m])
-					b[i+m].
-						Sub(&t, &b[i+m]).
-						Mul(&b[i+m], &twiddles[stage][i])
+					b[i].Add(&b[i], &b[i+_m])
+					b[i+_m].
+						Sub(&t, &b[i+_m]).
+						Mul(&b[i+_m], &twiddles[_stage][i])
 				}
 
 			}
-		} else {
-			parallel.Execute(nbLoops, func(start, end int) {
-				for nn := start; nn < end; nn++ {
-					// each time we visit the whole a[:n]
-					// technically we want to parallelize the work among N go routines
-					// processing 1 / N of the work each time.
-					offset := nn << 1
-					b := a[offset*m : (offset+2)*m]
-					parallel.Execute(len(b)-m, func(start, end int) {
-						var t fr.Element
-						for i := start; i < end; i++ {
-							t = b[i]
-							b[i].Add(&b[i], &b[i+m])
-							b[i+m].
-								Sub(&t, &b[i+m]).
-								Mul(&b[i+m], &twiddles[stage][i])
-						}
-					}, bCPU)
-
-				}
-			})
 		}
+
+		wg.Done()
 	}
+
+	offset := len(a) / nCpus
+	for i := 0; i < nCpus; i++ {
+		start := i * offset
+		end := start + offset
+		go worker(a[start:end], stage)
+	}
+	wg.Wait()
+
+	// note that here nCpus can be larger than actual avaialbe number of cpus
+	// we know it's a power of 2 so we know each sub-fft is going to be aligned correctly
 
 }
 
