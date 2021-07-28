@@ -157,38 +157,76 @@ func difFFT(a []fr.Element, twiddles [][]fr.Element, stage, maxSplits int, chDon
 
 	nCpus := int(ecc.NextPowerOfTwo(uint64(runtime.NumCPU())))
 
+	// we fire runtime.NumCPU workers for the first part (ie where we just parallelize the butterflys)
+	type bWork struct {
+		wg *sync.WaitGroup
+		b []fr.Element 
+		m int 
+		stage int 
+		start int 
+		end int 
+	} 
+	chWork := make(chan bWork, nCpus)
+	for i:=0; i < nCpus; i++ {
+		go func() {
+			var t fr.Element
+			for w := range chWork {
+				for i := w.start; i < w.end; i++ {
+					t = w.b[i]
+					w.b[i].Add(&w.b[i], &w.b[i+w.m])
+					w.b[i+w.m].
+						Sub(&t, &w.b[i+w.m]).
+						Mul(&w.b[i+w.m], &twiddles[w.stage][i])
+				}
+				w.wg.Done()
+			}
+		}()		
+	}
+
 	for stage = 0; stage < len(twiddles); stage++ {
 		if 1 << stage == nCpus {
 			break
 		}
 		m >>= 1
 		nbLoops := 1 << stage
-		bCpus := nCpus / nbLoops
-		// TODO we could try to fire one go routine per loop and use nCpu / nbLoops CPU per butterfly
 		var wg sync.WaitGroup
-		wg.Add(nbLoops)
 		for nn := 0; nn < nbLoops; nn++ {
-			go func(nn int) {
-				// each time we visit the whole a[:n]
-				// technically we want to parallelize the work among N go routines
-				// processing 1 / N of the work each time. 
-				offset := nn << 1
-				b := a[offset*m:(offset+2)*m]
-				parallel.Execute(len(b)-m , func(start, end int) {
-					var t fr.Element
-					for i := start; i < end; i++ {
-						t = b[i]
-						b[i].Add(&b[i], &b[i+m])
-						b[i+m].
-							Sub(&t, &b[i+m]).
-							Mul(&b[i+m], &twiddles[stage][i])
-					}
-				}, bCpus)
-				wg.Done()
-			}(nn)
+			// each time we visit the whole a[:n]
+			// technically we want to parallelize the work among N go routines
+			// processing 1 / N of the work each time. 
+			offset := nn << 1
+			b := a[offset*m:(offset+2)*m]
+			// we have to split len(b) - m by nCpus 
+			if (len(b) - m) % nCpus != 0 {
+				panic("happens")
+			}
+			interval := (len(b) - m) / nCpus 
+			nbIntervals := (len(b) - m) / interval 
+
+			
+		wg.Add(nbIntervals)
+			for i := 0; i < nbIntervals; i++ {
+				start := i * interval 
+				end := start + interval 
+				chWork <- bWork{&wg, b, m, stage, start, end}
+			}
+				
+			{{/* parallel.Execute(len(b)-m , func(start, end int) {
+				var t fr.Element
+				for i := start; i < end; i++ {
+					t = b[i]
+					b[i].Add(&b[i], &b[i+m])
+					b[i+m].
+						Sub(&t, &b[i+m]).
+						Mul(&b[i+m], &twiddles[stage][i])
+				}
+			}, bCpus) */}}
 		}
-		wg.Wait()
+			wg.Wait()
+
 	}
+
+	close(chWork) // kill the go routines
 
 	var wg sync.WaitGroup 
 	wg.Add(nCpus)
