@@ -24,7 +24,7 @@ import (
 	"golang.org/x/crypto/sha3"
 )
 
-const mimcNbRounds = 600001
+const mimcNbRounds = 800001
 
 // BlockSize size that mimc consumes
 const BlockSize = 32
